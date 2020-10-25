@@ -72,6 +72,54 @@ do
   end
 end
 
+-- createInteriorPartition creates a partition of grid that excludes the points
+-- that are closer then RADIUS to the boundaries of the grid.
+task createInteriorPartition(grid: region(ispace(int2d), Point))
+  var coloring = c.legion_domain_coloring_create()
+  var bounds = grid.ispace.bounds
+  c.legion_domain_coloring_color_domain(
+    coloring,
+    0,
+    rect2d { bounds.lo + {RADIUS, RADIUS}, bounds.hi - {RADIUS, RADIUS} }
+  )
+  var interiorPartition = partition(disjoint, grid, coloring)
+  c.legion_domain_coloring_destroy(coloring)
+  return interiorPartition
+end
+
+-- applyStencil applies the input star stencil to each point in the input grid region.
+task applyStencil(
+  stencil: region(ispace(int2d), Value),
+  grid: region(ispace(int2d), Point)
+) where
+  reads(stencil.val, grid.{input, output}),
+  writes(grid.output)
+do
+  for p in grid do
+    var i = p.x
+    var j = p.y
+    
+    for jj=-RADIUS,RADIUS+1 do
+      grid[p].output += stencil[{0, jj}].val * grid[{i, j+jj}].input
+    end
+    for ii=-RADIUS,0 do
+      grid[p].output += stencil[{ii, 0}].val * grid[{i+ii, j}].input
+    end
+    for ii=1,RADIUS+1 do
+      grid[p].output += stencil[{ii, 0}].val * grid[{i+ii, j}].input
+    end
+  end
+end
+
+-- addConstantToInput adds a constant to every element of the input region.
+task addConstantToInput(grid: region(ispace(int2d), Point))
+where
+  reads writes(grid.input)
+do
+  for p in grid do
+    grid[p].input += 1.0
+  end
+end
 
 task toplevel()
   -- Set up the configuration for the problem.
@@ -95,6 +143,7 @@ task toplevel()
   var gridSpace = ispace(int2d, {conf.n, conf.n})
   var grid = region(gridSpace, Point)
   initializeGrid(grid)
+  var gridInterior = createInteriorPartition(grid)[0]
 
   -- TODO (rohany): The refinements are stored in this chunk of 4 grid size refinements. Whats up with that?
   -- TODO (rohany): Have to initialize the refinement regions.
@@ -128,7 +177,10 @@ task toplevel()
     
     -- TODO (rohany): Maybe perform sub iterations?
 
-    -- TODO (rohany): Apply the stencil operator to the background grid.
+    -- Apply the stencil operator to the background grid.
+    applyStencil(stencil, gridInterior)
+    -- Add constant to solution to force refresh of neighbor data.
+    addConstantToInput(grid)
   end
 
   __fence(__execution, __block)
@@ -161,9 +213,7 @@ task toplevel()
   end
   -- TODO (rohany): Display the number of flops.
 
-
-  __fence(__execution, __block)
-  c.printf("Hello world\n")
+  c.printf("Elapsed time = %7.3f s \n", stencilTime * 1e-6)
 end
 
 terra registerMappers()

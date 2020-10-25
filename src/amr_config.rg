@@ -104,12 +104,12 @@ terra printConfig(conf: Config)
   c.printf("Iterations: %d\n", conf.iterations)
   c.printf("Refinements:\n")
   c.printf("\tGrid Size: %d\n", conf.n)
-  c.printf("\t Refinement number: %d\n", conf.refinements)
-  c.printf("\t Refinement level: %d\n", conf.refinementLevel)
-  c.printf("\t Refinement period: %d\n", conf.refinementPeriod)
-  c.printf("\t Refinement duration: %d\n", conf.refinementDuration)
-  c.printf("\t Refinement iterations: %d\n", conf.refinementIterations)
+  c.printf("\tRefinement number: %d\n", conf.refinements)
+  c.printf("\tRefinement level: %d\n", conf.refinementLevel)
+  c.printf("\tRefinement period: %d\n", conf.refinementPeriod)
+  c.printf("\tRefinement duration: %d\n", conf.refinementDuration)
+  c.printf("\tRefinement iterations: %d\n", conf.refinementIterations)
   if conf.tiling then
-    c.printf("\t Tile size: %d\n", conf.tileSize)
+    c.printf("\tTile size: %d\n", conf.tileSize)
   end
 end
