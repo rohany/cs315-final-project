@@ -18,20 +18,18 @@ local COEFY = 1.0
 local RADIUS = 2
 local REFINEMENTS = 4
 
--- TODO (rohany): Might want a "state" struct that holds onto these things.
-
--- TODO (rohany): Comment these field spaces.
--- TODO (rohany): I think that this can be used for both the grid and
---  refinement regions.
+-- Point is a field space corresponding to a point on the mesh.
 fspace Point {
   input: double,
   output: double,
 }
 
+-- Value is a field space corresponding to a single double.
 fspace Value {
   val: double,
 }
 
+-- abs is a utility function to compute |x|.
 terra abs(x: double)
   if x >= 0 then
     return x
@@ -40,6 +38,7 @@ terra abs(x: double)
   end
 end
 
+-- initializeGrid initializes an input grid.
 task initializeGrid(grid: region(ispace(int2d), Point))
 where
   reads writes(grid)
@@ -50,6 +49,7 @@ do
   end
 end
 
+-- initializeStencil initializes a star stencil.
 task initializeStencil(stencil: region(ispace(int2d), Value))
 where
   reads writes(stencil)
@@ -68,6 +68,8 @@ do
   end
 end
 
+-- initializeRefinementStencil initializes a stencil for the refinement,
+-- which is slightly different than the normal stencil.
 task initializeRefinementStencil(
   conf: Config, 
   stencil: region(ispace(int2d), Value), 
@@ -181,6 +183,8 @@ do
   end
 end
 
+-- normGridOuput and normGridInput are helper functions used to collect
+-- information about the resulting grids while validating the solution.
 task normGridOutput(grid: region(ispace(int2d), Point), numPoints: double)
 where
   reads (grid)
@@ -191,7 +195,6 @@ do
   end
   return n / numPoints
 end
-
 task normGridInput(grid: region(ispace(int2d), Point), numPoints: int)
 where
   reads (grid)
@@ -203,7 +206,7 @@ do
   return n / numPoints
 end
 
-
+-- toplevel is the main AMR task.
 task toplevel()
   -- Set up the configuration for the problem.
   var conf : Config
@@ -236,7 +239,6 @@ task toplevel()
   c.printf("   Level                  = %d\n", conf.refinementLevel);
   c.printf("   Sub-iterations         = %d\n", conf.refinementIterations);
   
-
   -- Create a region for the grid representing the problem.
   var gridSpace = ispace(int2d, {conf.n, conf.n})
   var grid = region(gridSpace, Point)
@@ -277,10 +279,12 @@ task toplevel()
   jstart[1] = conf.n - conf.refinements
   jstart[2] = conf.n - conf.refinements
   
+  -- Set up initial state for the main simulation loop.
   var stencilTime = 0
   var numInterpolations = 0
   var g = 0
  
+  -- Set up fence to complete all initialization logic.
   __fence(__execution, __block)
 
   for iter = 0, conf.iterations + 1 do
@@ -385,20 +389,27 @@ task toplevel()
     regentlib.assert(abs(normR[g] - referenceNormR[g]) <= EPSILON, "computed refinement norm too large")
     regentlib.assert(abs(normInR[g] - referenceNormInR[g]) <= EPSILON, "computed refinement input norm too large")
   end
-
+  -- At this point, the computation is correct!
   c.printf("Solution validates!\n")
 
-  -- TODO (rohany): Compute the number of FLOPS.
+  -- Compute the number of FLOPS.
   var flops = conf.activePoints * conf.iterations
-  -- TODO (rohany): Add in the flops for each refinement.
+  -- Add in the flops for each refinement.
   flops = flops * (2 * stencilSize + 1)
+  iterationsR[0] -= 1
+  for g = 0, 4 do
+    flops += conf.activeRefinementPoints * iterationsR[0]
+  end
   if conf.refinementLevel > 0 then
     numInterpolations--
     flops += conf.nRefinementTrue * (numInterpolations) * 3 * (conf.nRefinementTrue * conf.refinements)
   end
-  -- TODO (rohany): Display the number of flops.
-
-  c.printf("Elapsed time = %7.3f s \n", stencilTime * 1e-6)
+  
+  -- Print out info about the run.
+  var timeSeconds = stencilTime * 1e-6
+  var avgTime = timeSeconds / conf.iterations
+  c.printf("MFLOPS = %7.3f, Avg time (s): %7.3f\n", 1e-6 * flops / timeSeconds, timeSeconds / conf.iterations)
+  c.printf("Elapsed time = %7.3f s \n", timeSeconds)
 end
 
 terra registerMappers()
