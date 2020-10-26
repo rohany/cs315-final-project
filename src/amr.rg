@@ -16,6 +16,7 @@ local COEFX = 1.0
 local COEFY = 1.0
 -- TODO (rohany): Can this be a compile time flag?
 local RADIUS = 2
+local REFINEMENTS = 4
 
 -- TODO (rohany): Might want a "state" struct that holds onto these things.
 
@@ -30,6 +31,14 @@ fspace Point {
 fspace Value {
   val: double,
 }
+
+terra abs(x: double)
+  if x >= 0 then
+    return x
+  else
+    return -x
+  end
+end
 
 task initializeGrid(grid: region(ispace(int2d), Point))
 where
@@ -121,23 +130,112 @@ do
   end
 end
 
+-- Use a two-stage, bi-linear interpolation from background grid to refinement.
+task interpolateRefinement(
+  refinement: region(ispace(int2d), Point),
+  grid: region(ispace(int2d), Point),
+  conf: Config,
+  istart: int,
+  jstart: int
+) where
+  reads(grid.{input}, refinement.{input}),
+  writes(refinement.{input})
+do
+  -- If the same resolution, then just copy the background grid.
+  if conf.expand == 1 then
+    -- TODO (rohany): Should these loops be flipped?
+    -- TODO (rohany): Can we change this to iteration over an index space?
+    for jr = 0, conf.nRefinementTrue do
+      for ir = 0, conf.nRefinementTrue do
+        refinement[{ir, jr}].input = grid[{ir + istart, jr + jstart}].input
+      end
+    end
+  else
+    var iend = istart + (conf.nRefinementTrue - 1) / conf.expand
+    var jend = jstart + (conf.nRefinementTrue - 1) / conf.expand
+
+    -- First, interpolate in the x direction.
+    var jb = jstart
+    for jr = 0, conf.nRefinementTrue, conf.expand do
+      for ir = 0, conf.nRefinementTrue - 1 do
+        var xr : double = istart + conf.meshSpacing * ir
+        var ib : int32 = xr
+        var xb : double = ib
+        refinement[{ir, jr}].input = grid[{ib+1, jb}].input * (xr - xb) + grid[{ib, jb}].input * (xb + 1.0 - xr)
+      end
+      refinement[{conf.nRefinementTrue - 1, jr}].input = grid[{iend, jb}].input
+      jb += 1
+    end
+
+    -- Next, interpolate in the y direction.
+    for jr = 0, conf.nRefinementTrue - 1 do
+      var yr : double = conf.meshSpacing * jr
+      var jb : int = yr
+      var jrb : int = jb * conf.expand
+      var jrb1 : int = (jb + 1) * conf.expand
+      var yb : double = jb
+      for ir = 0, conf.nRefinementTrue do
+        refinement[{ir, jr}].input = refinement[{ir, jrb1}].input * (yr - yb) + refinement[{ir, jrb}].input * (yb + 1.0 - yr)
+      end
+    end
+  end
+end
+
+task normGridOutput(grid: region(ispace(int2d), Point), numPoints: double)
+where
+  reads (grid)
+do
+  var n = 0.0
+  for p in grid do
+    n += abs(grid[p].output)
+  end
+  return n / numPoints
+end
+
+task normGridInput(grid: region(ispace(int2d), Point), numPoints: int)
+where
+  reads (grid)
+do
+  var n = 0.0
+  for p in grid do
+    n += abs(grid[p].input)
+  end
+  return n / numPoints
+end
+
+
 task toplevel()
   -- Set up the configuration for the problem.
   var conf : Config
   initializeConfig(&conf)
   parseInputArguments(&conf)
   validateConfig(conf)
-  printConfig(conf)
 
   -- Intialize some more state in the config.
   conf.nRefinementTrue = (conf.refinements - 1) * conf.expand + 1
   conf.activePoints = (conf.n - 2 * RADIUS) * (conf.n - 2 * RADIUS)
   conf.activeRefinementPoints = (conf.nRefinementTrue - 2 * RADIUS) * (conf.nRefinementTrue - 2 * RADIUS)
 
-  -- Regions that we want:
-  -- There are input and output regions of size n*n.
-  -- There are input and output regions for each of the refinements?
-  -- There is a stencil region that has some weights in it I think.
+  -- Print out data to match the serial code.
+  c.printf("Background grid size = %d\n", conf.n)
+  c.printf("Radius of stencil    = %d\n", RADIUS)
+  c.printf("Type of stencil      = star\n")
+  c.printf("Data type            = double precision\n")
+  c.printf("Compact representation of stencil loop body\n")
+  if conf.tiling then 
+    c.printf("Tile size            = %d\n", conf.tileSize)
+  else
+    c.printf("Untiled\n")
+  end
+  c.printf("Number of iterations = %d\n", conf.iterations);
+  c.printf("Refinements:\n");
+  c.printf("   Background grid points = %ld\n", conf.refinements);
+  c.printf("   Grid size              = %ld\n", conf.nRefinementTrue);
+  c.printf("   Period                 = %d\n", conf.refinementPeriod);
+  c.printf("   Duration               = %d\n", conf.refinementDuration);
+  c.printf("   Level                  = %d\n", conf.refinementLevel);
+  c.printf("   Sub-iterations         = %d\n", conf.refinementIterations);
+  
 
   -- Create a region for the grid representing the problem.
   var gridSpace = ispace(int2d, {conf.n, conf.n})
@@ -145,8 +243,22 @@ task toplevel()
   initializeGrid(grid)
   var gridInterior = createInteriorPartition(grid)[0]
 
-  -- TODO (rohany): The refinements are stored in this chunk of 4 grid size refinements. Whats up with that?
-  -- TODO (rohany): Have to initialize the refinement regions.
+  -- Set up the regions corresponding to the refinements.
+  var refinementSpace = ispace(int2d, {conf.nRefinementTrue, conf.nRefinementTrue})
+  -- TODO (rohany): We want to replace this with some metaprogramming...
+  var refinement1 = region(refinementSpace, Point)
+  var refinement2 = region(refinementSpace, Point)
+  var refinement3 = region(refinementSpace, Point)
+  var refinement4 = region(refinementSpace, Point)
+  var refinementInterior1 = createInteriorPartition(refinement1)[0]
+  var refinementInterior2 = createInteriorPartition(refinement2)[0]
+  var refinementInterior3 = createInteriorPartition(refinement3)[0]
+  var refinementInterior4 = createInteriorPartition(refinement4)[0]
+  -- Initialize the refinements with 0.
+  fill(refinement1.{input, output}, 0.0)
+  fill(refinement2.{input, output}, 0.0)
+  fill(refinement3.{input, output}, 0.0)
+  fill(refinement4.{input, output}, 0.0)
 
   -- Create a region for the stencil. We offset the index space to get an index
   -- space from {-RADIUS, -RADIUS} to {RADIUS, RADIUS}.
@@ -156,16 +268,20 @@ task toplevel()
   var refinementStencil = region(stencilSpace, Value)
   initializeStencil(stencil)
   initializeRefinementStencil(conf, stencil, refinementStencil)
+
+  -- Initialize refinement layouts.
+  var istart = array(0, 0, 0, 0)
+  var jstart = array(0, 0, 0, 0)
+  istart[1] = conf.n - conf.refinements
+  istart[3] = conf.n - conf.refinements
+  jstart[1] = conf.n - conf.refinements
+  jstart[2] = conf.n - conf.refinements
   
-
-  -- TODO (rohany): Initialize refinement arrays.
-
-  __fence(__execution, __block)
-
   var stencilTime = 0
   var numInterpolations = 0
+  var g = 0
  
-  -- TODO (rohany): Main AMR operation.
+  __fence(__execution, __block)
 
   for iter = 0, conf.iterations + 1 do
     -- Start timer after a warmup iteration.
@@ -173,9 +289,46 @@ task toplevel()
       stencilTime = c.legion_get_current_time_in_micros()
     end
 
-    -- TODO (rohany): Interpolate the refinements into life.
+    -- If we're at an iteration where a refinement should occur, interpolate
+    -- to create the refinement.
+    if iter % conf.refinementPeriod == 0 then
+      g = (iter / conf.refinementPeriod) % 4
+      numInterpolations += 1
+      if g == 0 then
+        interpolateRefinement(refinement1, grid, conf, istart[g], jstart[g])
+      elseif g == 1 then
+        interpolateRefinement(refinement2, grid, conf, istart[g], jstart[g])
+      elseif g == 2 then
+        interpolateRefinement(refinement3, grid, conf, istart[g], jstart[g])
+      else
+        interpolateRefinement(refinement4, grid, conf, istart[g], jstart[g])
+      end
+    end
     
-    -- TODO (rohany): Maybe perform sub iterations?
+    -- Perform any needed stencil iterations on the refinement grids.
+    if (iter % conf.refinementPeriod) < conf.refinementDuration then
+      var rg : region(ispace(int2d), Point)
+      for subIter = 0, conf.refinementIterations do
+        if g == 0 then
+          applyStencil(refinementStencil, refinementInterior1)
+        elseif g == 1 then
+          applyStencil(refinementStencil, refinementInterior2)
+        elseif g == 2 then
+          applyStencil(refinementStencil, refinementInterior3)
+        else
+          applyStencil(refinementStencil, refinementInterior4)
+        end
+        if g == 0 then
+          addConstantToInput(refinement1)
+        elseif g == 1 then
+          addConstantToInput(refinement2)
+        elseif g == 2 then
+          addConstantToInput(refinement3)
+        else
+          addConstantToInput(refinement4)
+        end
+      end
+    end
 
     -- Apply the stencil operator to the background grid.
     applyStencil(stencil, gridInterior)
@@ -186,22 +339,54 @@ task toplevel()
   __fence(__execution, __block)
   stencilTime = c.legion_get_current_time_in_micros() - stencilTime
 
-  -- TODO (rohany): Compute normalized L1 solution norm on background grid.
+  -- Compute normalized L1 solution norm on background grid.
+  var norm : double = normGridOutput(gridInterior, conf.activePoints)
+  -- Compute normalized L1 input field norm on background grid.
+  var normIn : double = normGridInput(grid, conf.n * conf.n)
 
-  -- TODO (rohany): Compute normalized L1 input field norm on background grid.
+  -- Compute the same norms on each of the refinements.
+  var normR = array(0.0, 0.0, 0.0, 0.0)
+  var normInR = array(0.0, 0.0, 0.0, 0.0)
+  normR[0] = normGridOutput(refinementInterior1, conf.activeRefinementPoints)
+  normInR[0] = normGridInput(refinement1, conf.nRefinementTrue * conf.nRefinementTrue)
+  normR[1] = normGridOutput(refinementInterior2, conf.activeRefinementPoints)
+  normInR[1] = normGridInput(refinement2, conf.nRefinementTrue * conf.nRefinementTrue)
+  normR[2] = normGridOutput(refinementInterior3, conf.activeRefinementPoints)
+  normInR[2] = normGridInput(refinement3, conf.nRefinementTrue * conf.nRefinementTrue)
+  normR[3] = normGridOutput(refinementInterior4, conf.activeRefinementPoints)
+  normInR[3] = normGridInput(refinement4, conf.nRefinementTrue * conf.nRefinementTrue)
 
-  -- TODO (rohany): Compute the same norms on each of the refinements.
+  -- Verify correctness of background grid solution and input field.
+  var referenceNorm : double = (conf.iterations + 1) * (COEFX + COEFY);
+  var referenceNormIn : double = (COEFX + COEFY) * (1.0) * ((conf.n - 1)/2.0) + conf.iterations + 1
+  regentlib.assert(abs(norm - referenceNorm) <= EPSILON, "computed norm too large")
+  regentlib.assert(abs(normIn - referenceNormIn) <= EPSILON, "computed input norm too large")
 
-  -- TODO (rohany): Verify correctness of background grid solution and input field.
-  var referenceNorm = (conf.iterations + 1) * (COEFX + COEFY);
-  var referenceNormIn = (COEFX + COEFY) * (1.0) * ((conf.n - 1)/2.0) + conf.iterations + 1
-  -- TODO (rohany): Uncomment once we have computed the norm.
-  -- regentlib.assert(math.abs(norm - referenceNorm) <= EPSILON, "computed norm too large")
-  -- regentlib.assert(math.abs(norm_in - referenceNormIn) <= EPSILON, "computed input norm too large")
-
-  -- TODO (rohany): Verify correctness of the refinement grid.
+  -- Verify correctness of the refinement grid.
   var fullCycles = ((conf.iterations + 1) / (conf.refinementPeriod * 4))
   var leftoverIterations = (conf.iterations + 1) % (conf.refinementPeriod * 4)
+  var referenceNormR = array(0.0, 0.0, 0.0, 0.0)
+  var referenceNormInR = array(0.0, 0.0, 0.0, 0.0)
+  var iterationsR = array(0.0, 0.0, 0.0, 0.0)
+  for g = 0, 4 do
+    iterationsR[g] = conf.refinementIterations * (fullCycles * conf.refinementDuration + min(max(0, leftoverIterations - g * conf.refinementPeriod), conf.refinementDuration))
+    referenceNormR[g] = iterationsR[g] * (COEFX + COEFY)
+    if iterationsR[g] == 0 then
+      referenceNormInR[g] = 0
+    else
+      var bgUpdates = (fullCycles * 4 + g) * conf.refinementPeriod
+      var rUpdates = min(max(0, leftoverIterations - g * conf.refinementPeriod), conf.refinementDuration) * conf.refinementIterations
+      if bgUpdates > conf.iterations then
+        bgUpdates -= 4 * conf.refinementPeriod
+        rUpdates = conf.refinementIterations * conf.refinementDuration
+      end
+      referenceNormInR[g] = (COEFX * istart[g] + COEFY * jstart[g]) + (COEFX + COEFY) * (conf.refinements - 1) / 2.0 + bgUpdates + rUpdates
+    end
+    regentlib.assert(abs(normR[g] - referenceNormR[g]) <= EPSILON, "computed refinement norm too large")
+    regentlib.assert(abs(normInR[g] - referenceNormInR[g]) <= EPSILON, "computed refinement input norm too large")
+  end
+
+  c.printf("Solution validates!\n")
 
   -- TODO (rohany): Compute the number of FLOPS.
   var flops = conf.activePoints * conf.iterations
