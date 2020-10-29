@@ -49,40 +49,6 @@ do
   end
 end
 
--- initializeStencil initializes a star stencil.
-task initializeStencil(stencil: region(ispace(int2d), Value))
-where
-  reads writes(stencil)
-do
-  -- Initialize all of the stencil values.
-  for p in stencil do
-    stencil[p].val = 0.0
-  end
-  -- Fill in parts of the stencil now.
-  for i = 1, RADIUS + 1 do
-    var stencilVal = 1.0 / (2.0 * i * RADIUS)
-    stencil[{0, i}].val = stencilVal
-    stencil[{i, 0}].val = stencilVal
-    stencil[{0, -i}].val = -stencilVal
-    stencil[{-i, 0}].val = -stencilVal
-  end
-end
-
--- initializeRefinementStencil initializes a stencil for the refinement,
--- which is slightly different than the normal stencil.
-task initializeRefinementStencil(
-  conf: Config, 
-  stencil: region(ispace(int2d), Value), 
-  refinement: region(ispace(int2d), Value)
-) where
-  reads(stencil, refinement),
-  writes(refinement)
-do
-  for p in stencil do
-    refinement[p].val = stencil[p].val * (conf.expand * 1.0)
-  end
-end
-
 -- createInteriorPartition creates a partition of grid that excludes the points
 -- that are closer then RADIUS to the boundaries of the grid.
 task createInteriorPartition(grid: region(ispace(int2d), Point))
@@ -98,29 +64,33 @@ task createInteriorPartition(grid: region(ispace(int2d), Point))
   return interiorPartition
 end
 
--- applyStencil applies the input star stencil to each point in the input grid region.
-task applyStencil(
-  stencil: region(ispace(int2d), Value),
-  grid: region(ispace(int2d), Point)
-) where
-  reads(stencil.val, grid.{input, output}),
-  writes(grid.output)
+-- applyStencil applies the statically known "star" stencil to each point
+-- in the input grid.
+task applyStencil(mult: double, grid: region(ispace(int2d), Point)) where
+  reads(grid.{input, output}), writes(grid.output)
 do
   for p in grid do
     var i = p.x
     var j = p.y
+
+    for jj=-RADIUS,0 do
+      grid[p].output += mult / (2.0 * RADIUS * jj) * grid[{i, j + jj}].input
+    end
+
+    for jj=1,RADIUS+1 do
+      grid[p].output += mult / (2.0 * RADIUS * jj) * grid[{i, j + jj}].input
+    end
     
-    for jj=-RADIUS,RADIUS+1 do
-      grid[p].output += stencil[{0, jj}].val * grid[{i, j+jj}].input
-    end
     for ii=-RADIUS,0 do
-      grid[p].output += stencil[{ii, 0}].val * grid[{i+ii, j}].input
+      grid[p].output += mult / (2.0 * RADIUS * ii) * grid[{i+ii, j}].input
     end
+
     for ii=1,RADIUS+1 do
-      grid[p].output += stencil[{ii, 0}].val * grid[{i+ii, j}].input
+      grid[p].output += mult / (2.0 * RADIUS * ii) * grid[{i+ii, j}].input
     end
   end
 end
+
 
 -- addConstantToInput adds a constant to every element of the input region.
 task addConstantToInput(grid: region(ispace(int2d), Point))
@@ -301,14 +271,7 @@ function generateMainTask(N)
       end)
     ];
 
-    -- Create a region for the stencil. We offset the index space to get an index
-    -- space from {-RADIUS, -RADIUS} to {RADIUS, RADIUS}.
     var stencilSize = 4 * RADIUS + 1
-    var stencilSpace = ispace(int2d, {2 * RADIUS + 1, 2 * RADIUS + 1}, {-1 * RADIUS, -1 * RADIUS})
-    var stencil = region(stencilSpace, Value)
-    var refinementStencil = region(stencilSpace, Value)
-    initializeStencil(stencil)
-    initializeRefinementStencil(conf, stencil, refinementStencil)
     
     -- Initialize refinement layouts.
     var istart = array(0, 0, 0, 0)
@@ -353,7 +316,7 @@ function generateMainTask(N)
           [
             generateIf(4, g, function(i) return
               rquote
-                applyStencil(refinementStencil, [refinementInteriors[i]])
+                applyStencil(conf.expand, [refinementInteriors[i]])
                 addConstantToInput([refinements[i]])
               end 
             end)
@@ -362,7 +325,7 @@ function generateMainTask(N)
       end
       
       -- Apply the stencil operator to the background grid.
-      applyStencil(stencil, gridInterior)
+      applyStencil(1.0, gridInterior)
       -- Add constant to solution to force refresh of neighbor data.
       addConstantToInput(grid)
     end
