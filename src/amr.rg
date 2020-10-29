@@ -38,6 +38,22 @@ terra abs(x: double)
   end
 end
 
+-- factorize constructs a rectangle of size roughly [sqrt(parallelism), sqrt(parallelism)].
+task factorize(parallelism : int) : int2d
+  var limit = [int](math.sqrt([double](parallelism)))
+  var size_x = 1
+  var size_y = parallelism
+  for i = 1, limit + 1 do
+    if parallelism % i == 0 then
+      size_x, size_y = i, parallelism / i
+      if size_x > size_y then
+        size_x, size_y = size_y, size_x
+      end
+    end
+  end
+  return int2d { size_x, size_y }
+end
+
 -- initializeGrid initializes an input grid.
 task initializeGrid(grid: region(ispace(int2d), Point))
 where
@@ -65,32 +81,37 @@ task createInteriorPartition(grid: region(ispace(int2d), Point))
 end
 
 -- applyStencil applies the statically known "star" stencil to each point
--- in the input grid.
-task applyStencil(mult: double, grid: region(ispace(int2d), Point)) where
-  reads(grid.{input, output}), writes(grid.output)
+-- in the input grid. It operates on a private partition of the grid to
+-- write into, and a halo partition of each private partition to read from.
+task applyStencil(
+  mult: double, 
+  halo: region(ispace(int2d), Point),
+  private: region(ispace(int2d), Point)
+) where
+  reads(halo.input, private.output),
+  writes(private.output)
 do
-  for p in grid do
+  for p in private do
     var i = p.x
     var j = p.y
 
     for jj=-RADIUS,0 do
-      grid[p].output += mult / (2.0 * RADIUS * jj) * grid[{i, j + jj}].input
+      private[p].output += mult / (2.0 * RADIUS * jj) * halo[{i, j + jj}].input
     end
 
     for jj=1,RADIUS+1 do
-      grid[p].output += mult / (2.0 * RADIUS * jj) * grid[{i, j + jj}].input
+      private[p].output += mult / (2.0 * RADIUS * jj) * halo[{i, j + jj}].input
     end
     
     for ii=-RADIUS,0 do
-      grid[p].output += mult / (2.0 * RADIUS * ii) * grid[{i+ii, j}].input
+      private[p].output += mult / (2.0 * RADIUS * ii) * halo[{i+ii, j}].input
     end
 
     for ii=1,RADIUS+1 do
-      grid[p].output += mult / (2.0 * RADIUS * ii) * grid[{i+ii, j}].input
+      private[p].output += mult / (2.0 * RADIUS * ii) * halo[{i+ii, j}].input
     end
   end
 end
-
 
 -- addConstantToInput adds a constant to every element of the input region.
 task addConstantToInput(grid: region(ispace(int2d), Point))
@@ -103,6 +124,7 @@ do
 end
 
 -- Use a two-stage, bi-linear interpolation from background grid to refinement.
+-- TODO (rohany): Parallelize this. It seems like it will be tricky though.
 task interpolateRefinement(
   refinement: region(ispace(int2d), Point),
   grid: region(ispace(int2d), Point),
@@ -208,8 +230,28 @@ function generateMainTask(N)
   local refinements = generate(4, function(i)
     return regentlib.newsymbol()
   end)
+  -- refinementPartitions is the constant set of equal partitions of the
+  -- refinements.
+  local refinementPartitions = generate(4, function(i)
+    return regentlib.newsymbol()
+  end)
   -- refinementInteriors is the constant set of refinement interior grids.
   local refinementInteriors = generate(4, function(i)
+    return regentlib.newsymbol()
+  end)
+  -- refinementPrivateInteriors is the constant set of equal partitions of
+  -- the refinements.
+  local refinementPrivateInteriors = generate(4, function(i)
+    return regentlib.newsymbol()
+  end)
+  -- refinementHalos is the constant set of halo partitions for each partition
+  -- in refinementPrivateInteriors.
+  local refinementHalos = generate(4, function(i)
+    return regentlib.newsymbol()
+  end)
+  -- refinementHaloColorings is a set of temporary objects use to partition each
+  -- refinement.
+  local refinementHaloColorings = generate(4, function(i)
     return regentlib.newsymbol()
   end)
   -- refinementNorms is a set of 0's equal to the number of refinements to
@@ -249,22 +291,55 @@ function generateMainTask(N)
     c.printf("   Duration               = %d\n", conf.refinementDuration);
     c.printf("   Level                  = %d\n", conf.refinementLevel);
     c.printf("   Sub-iterations         = %d\n", conf.refinementIterations);
+    c.printf("   Parallelism            = %d\n", conf.parallelism);
     
     -- Create a region for the grid representing the problem.
     var gridSpace = ispace(int2d, {conf.n, conf.n})
+    var gridColors = ispace(int2d, factorize(conf.parallelism))
     var grid = region(gridSpace, Point)
+    var gridPartition = partition(equal, grid, gridColors)
+    -- TODO (rohany): Parallelize this initialization.
     initializeGrid(grid)
     var gridInterior = createInteriorPartition(grid)[0]
 
+    -- Partition the interior grid into equal chunks.
+    var gridInteriorPrivate = partition(equal, gridInterior, gridColors)
+    -- Create a halo partition for ghost region access.
+    var cHalo = c.legion_domain_point_coloring_create()
+    for color in gridColors do
+      var bounds = gridInteriorPrivate[color].bounds
+      var haloBounds = rect2d { bounds.lo - {RADIUS, RADIUS}, bounds.hi + {RADIUS, RADIUS} }
+      c.legion_domain_point_coloring_color_domain(cHalo, color, haloBounds)
+    end
+    var gridHalo = partition(aliased, grid, cHalo, gridColors)
+    c.legion_domain_point_coloring_destroy(cHalo)
+
     -- Set up the regions corresponding to the refinements.
-    var refinementSpace = ispace(int2d, {conf.nRefinementTrue, conf.nRefinementTrue});
+    var refinementSpace = ispace(int2d, {conf.nRefinementTrue, conf.nRefinementTrue})
+    -- TODO (rohany): We might want to have a separate parallelization parameter for
+    --  the refinement grids since they are smaller than the main grid.
+    var refinementColors = ispace(int2d, factorize(conf.parallelism));
     [ 
       generate (4, function (i) return
         rquote 
           -- Generate assignments for each refinement.
           var [refinements[i]] = region (refinementSpace, Point)
+          -- Generate equal partitions for each refinement.
+          var [refinementPartitions[i]] = partition(equal, [refinements[i]], refinementColors)
           -- Create the refinement interior partitions.
           var [refinementInteriors[i]] = createInteriorPartition([refinements[i]])[0]
+          -- Create the private partitions of the interior.
+          var [refinementPrivateInteriors[i]] = partition(equal, [refinementInteriors[i]], refinementColors)
+          -- Create a halo partition for each refinement region's ghost access.
+          -- TODO (rohany): Can we refactor this code to not duplicate as much?
+          var [refinementHaloColorings[i]] = c.legion_domain_point_coloring_create()
+          for color in refinementColors do
+            var bounds = [refinementPrivateInteriors[i]][color].bounds
+            var haloBounds = rect2d { bounds.lo - {RADIUS, RADIUS}, bounds.hi + {RADIUS, RADIUS} }
+            c.legion_domain_point_coloring_color_domain([refinementHaloColorings[i]], color, haloBounds)
+          end
+          var [refinementHalos[i]] = partition(aliased, [refinements[i]], [refinementHaloColorings[i]], refinementColors)
+          c.legion_domain_point_coloring_destroy([refinementHaloColorings[i]])
           -- Initialize each refinement region.
           fill([refinements[i]].{input, output}, 0.0)
         end
@@ -316,8 +391,12 @@ function generateMainTask(N)
           [
             generateIf(4, g, function(i) return
               rquote
-                applyStencil(conf.expand, [refinementInteriors[i]])
-                addConstantToInput([refinements[i]])
+                for color in refinementColors do
+                  applyStencil(conf.expand, [refinementHalos[i]][color], [refinementPrivateInteriors[i]][color])
+                end
+                for color in refinementColors do
+                  addConstantToInput([refinementPartitions[i]][color])
+                end
               end 
             end)
           ];
@@ -325,9 +404,13 @@ function generateMainTask(N)
       end
       
       -- Apply the stencil operator to the background grid.
-      applyStencil(1.0, gridInterior)
+      for c in gridColors do
+        applyStencil(1.0, gridHalo[c], gridInteriorPrivate[c])
+      end
       -- Add constant to solution to force refresh of neighbor data.
-      addConstantToInput(grid)
+      for c in gridColors do
+        addConstantToInput(gridPartition[c])
+      end
     end
     
     __fence(__execution, __block)
@@ -413,4 +496,4 @@ terra registerMappers()
 end
 -- TODO (rohany): If we are going to compile this on other machines
 --  than Sherlock, the PMIx link should be optional.
-regentlib.saveobj(amrMain, "amr", "executable", registerMappers, terralib.newlist({"-lpmix"}))
+regentlib.saveobj(amrMain, "amr", "executable", registerMappers, terralib.newlist({"-lpmix", "-lm"}))
