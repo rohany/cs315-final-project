@@ -18,6 +18,7 @@ struct Config {
   tiling: bool,
   tileSize: int,
   parallelism: int,
+  refinementParallelism: int,
 
   -- Scratch values.
   meshSpacing: double,
@@ -41,6 +42,7 @@ terra initializeConfig(conf: &Config)
   conf.tiling = false
   conf.tileSize = 0
   conf.parallelism = 1
+  conf.refinementParallelism = 1
 
   conf.meshSpacing = 1.0
   conf.expand = 1
@@ -78,6 +80,9 @@ terra parseInputArguments(conf: &Config)
     elseif cstring.strcmp(args.argv[i], "-p") == 0 then
       i = i + 1
       conf.parallelism = std.atoi(args.argv[i])
+    elseif cstring.strcmp(args.argv[i], "-pr") == 0 then
+      i = i + 1
+      conf.refinementParallelism = std.atoi(args.argv[i])
     end
   end
 
