@@ -55,6 +55,7 @@ task factorize(parallelism : int) : int2d
 end
 
 -- initializeGrid initializes an input grid.
+__demand(__cuda)
 task initializeGrid(grid: region(ispace(int2d), Point))
 where
   reads writes(grid)
@@ -83,6 +84,7 @@ end
 -- applyStencil applies the statically known "star" stencil to each point
 -- in the input grid. It operates on a private partition of the grid to
 -- write into, and a halo partition of each private partition to read from.
+__demand(__cuda)
 task applyStencil(
   mult: double, 
   halo: region(ispace(int2d), Point),
@@ -114,6 +116,7 @@ do
 end
 
 -- addConstantToInput adds a constant to every element of the input region.
+__demand(__cuda)
 task addConstantToInput(grid: region(ispace(int2d), Point))
 where
   reads writes(grid.input)
@@ -177,23 +180,35 @@ end
 
 -- normGridOuput and normGridInput are helper functions used to collect
 -- information about the resulting grids while validating the solution.
+-- Note that we do not use the "abs" function defined above as that interferes
+-- with CUDA code generation for these tasks.
+__demand(__cuda)
 task normGridOutput(grid: region(ispace(int2d), Point), numPoints: double)
 where
   reads (grid)
 do
   var n = 0.0
   for p in grid do
-    n += abs(grid[p].output)
+    if grid[p].output < 0 then
+      n += -grid[p].output
+    else
+      n += grid[p].output
+    end
   end
   return n / numPoints
 end
+__demand(__cuda)
 task normGridInput(grid: region(ispace(int2d), Point), numPoints: int)
 where
   reads (grid)
 do
   var n = 0.0
   for p in grid do
-    n += abs(grid[p].input)
+    if grid[p].output < 0 then
+      n += -grid[p].input
+    else
+      n += grid[p].input
+    end
   end
   return n / numPoints
 end
@@ -292,14 +307,16 @@ function generateMainTask(N)
     c.printf("   Level                  = %d\n", conf.refinementLevel);
     c.printf("   Sub-iterations         = %d\n", conf.refinementIterations);
     c.printf("   Parallelism            = %d\n", conf.parallelism);
+    c.printf("   Refinement Parallelism = %d\n", conf.refinementParallelism);
     
     -- Create a region for the grid representing the problem.
     var gridSpace = ispace(int2d, {conf.n, conf.n})
     var gridColors = ispace(int2d, factorize(conf.parallelism))
     var grid = region(gridSpace, Point)
     var gridPartition = partition(equal, grid, gridColors)
-    -- TODO (rohany): Parallelize this initialization.
-    initializeGrid(grid)
+    for c in gridColors do
+      initializeGrid(gridPartition[c])
+    end
     var gridInterior = createInteriorPartition(grid)[0]
 
     -- Partition the interior grid into equal chunks.
@@ -316,9 +333,7 @@ function generateMainTask(N)
 
     -- Set up the regions corresponding to the refinements.
     var refinementSpace = ispace(int2d, {conf.nRefinementTrue, conf.nRefinementTrue})
-    -- TODO (rohany): We might want to have a separate parallelization parameter for
-    --  the refinement grids since they are smaller than the main grid.
-    var refinementColors = ispace(int2d, factorize(conf.parallelism));
+    var refinementColors = ispace(int2d, factorize(conf.refinementParallelism));
     [ 
       generate (4, function (i) return
         rquote 
@@ -355,6 +370,19 @@ function generateMainTask(N)
     istart[3] = conf.n - conf.refinements
     jstart[1] = conf.n - conf.refinements
     jstart[2] = conf.n - conf.refinements
+
+    -- Construct a partition of the input grid for each refinement regions.
+    var rGridColors = c.legion_domain_point_coloring_create()
+    var refinementGridColors = ispace(int1d, 4)
+    for i in refinementGridColors do
+      var offset = (conf.nRefinementTrue - 1) / conf.expand
+      var idx = int(i)
+      var lo = {istart[idx], jstart[idx]}
+      var hi = {istart[idx] + offset, jstart[idx] + offset} 
+      c.legion_domain_point_coloring_color_domain(rGridColors, i, rect2d {lo, hi})
+    end
+    var gridPartitionsForRefinement = partition(aliased, grid, rGridColors, refinementGridColors)
+    c.legion_domain_point_coloring_destroy(rGridColors)
     
     -- Set up initial state for the main simulation loop.
     var stencilTime = 0
@@ -378,7 +406,7 @@ function generateMainTask(N)
         -- Pick the correct refinement to interpolate.
         [
           generateIf(4, g, function(i) return rquote
-              interpolateRefinement([refinements[i]], grid, conf, istart[g], jstart[g])
+              interpolateRefinement([refinements[i]], gridPartitionsForRefinement[g], conf, istart[g], jstart[g])
             end 
           end)
         ];
@@ -416,10 +444,16 @@ function generateMainTask(N)
     __fence(__execution, __block)
     stencilTime = c.legion_get_current_time_in_micros() - stencilTime
 
+    var norm = 0.0
+    var normIn = 0.0
     -- Compute normalized L1 solution norm on background grid.
-    var norm : double = normGridOutput(gridInterior, conf.activePoints)
+    for c in gridColors do
+      norm += normGridOutput(gridInteriorPrivate[c], conf.activePoints)
+    end
     -- Compute normalized L1 input field norm on background grid.
-    var normIn : double = normGridInput(grid, conf.n * conf.n)
+    for c in gridColors do
+      normIn += normGridInput(gridPartition[c], conf.n * conf.n)
+    end
 
     -- Compute the same norms on each of the refinements.
     var normR = array([refinementNorms])
@@ -427,8 +461,18 @@ function generateMainTask(N)
     [
       generate(4, function(i) return 
         rquote
-          normR[i - 1] = normGridOutput([refinementInteriors[i]], conf.activeRefinementPoints)
-          normInR[i - 1] = normGridInput([refinements[i]], conf.nRefinementTrue * conf.nRefinementTrue)
+          normR[i - 1] = 0.0
+          normInR[i - 1] = 0.0
+          for c in refinementColors do
+            -- For some reason, the code generator gets confused when this partition
+            -- is referenced directly in the task call, so we pull it out into a temp.
+            var p = [refinementPrivateInteriors[i]][c]
+            normR[i - 1] += normGridOutput(p, conf.activeRefinementPoints)
+          end
+          for c in refinementColors do
+            var p = [refinementPartitions[i]][c]
+            normInR[i - 1] += normGridInput(p, conf.nRefinementTrue * conf.nRefinementTrue)
+          end
         end
       end)
     ];
