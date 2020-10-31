@@ -126,6 +126,24 @@ do
   end
 end
 
+-- interpolateSimple is used when conf.expand == 1. In this case,
+-- we can just copy over values from the background grid.
+__demand(__cuda)
+task interpolateSimple(
+  refinement: region(ispace(int2d), Point),
+  grid: region(ispace(int2d), Point),
+  conf: Config,
+  istart: int,
+  jstart: int
+) where
+  reads(grid.{input}, refinement.{input}),
+  writes(refinement.{input})
+do
+  for p in refinement do
+    refinement[p].input = grid[{p.x + istart, p.y + jstart}].input
+  end
+end
+
 -- Use a two-stage, bi-linear interpolation from background grid to refinement.
 -- TODO (rohany): Parallelize this. It seems like it will be tricky though.
 task interpolateRefinement(
@@ -138,42 +156,31 @@ task interpolateRefinement(
   reads(grid.{input}, refinement.{input}),
   writes(refinement.{input})
 do
-  -- If the same resolution, then just copy the background grid.
-  if conf.expand == 1 then
-    -- TODO (rohany): Should these loops be flipped?
-    -- TODO (rohany): Can we change this to iteration over an index space?
-    for jr = 0, conf.nRefinementTrue do
-      for ir = 0, conf.nRefinementTrue do
-        refinement[{ir, jr}].input = grid[{ir + istart, jr + jstart}].input
-      end
-    end
-  else
-    var iend = istart + (conf.nRefinementTrue - 1) / conf.expand
-    var jend = jstart + (conf.nRefinementTrue - 1) / conf.expand
+  var iend = istart + (conf.nRefinementTrue - 1) / conf.expand
+  var jend = jstart + (conf.nRefinementTrue - 1) / conf.expand
 
-    -- First, interpolate in the x direction.
-    var jb = jstart
-    for jr = 0, conf.nRefinementTrue, conf.expand do
-      for ir = 0, conf.nRefinementTrue - 1 do
-        var xr : double = istart + conf.meshSpacing * ir
-        var ib : int32 = xr
-        var xb : double = ib
-        refinement[{ir, jr}].input = grid[{ib+1, jb}].input * (xr - xb) + grid[{ib, jb}].input * (xb + 1.0 - xr)
-      end
-      refinement[{conf.nRefinementTrue - 1, jr}].input = grid[{iend, jb}].input
-      jb += 1
+  -- First, interpolate in the x direction.
+  var jb = jstart
+  for jr = 0, conf.nRefinementTrue, conf.expand do
+    for ir = 0, conf.nRefinementTrue - 1 do
+      var xr : double = istart + conf.meshSpacing * ir
+      var ib : int32 = xr
+      var xb : double = ib
+      refinement[{ir, jr}].input = grid[{ib+1, jb}].input * (xr - xb) + grid[{ib, jb}].input * (xb + 1.0 - xr)
     end
+    refinement[{conf.nRefinementTrue - 1, jr}].input = grid[{iend, jb}].input
+    jb += 1
+  end
 
-    -- Next, interpolate in the y direction.
-    for jr = 0, conf.nRefinementTrue - 1 do
-      var yr : double = conf.meshSpacing * jr
-      var jb : int = yr
-      var jrb : int = jb * conf.expand
-      var jrb1 : int = (jb + 1) * conf.expand
-      var yb : double = jb
-      for ir = 0, conf.nRefinementTrue do
-        refinement[{ir, jr}].input = refinement[{ir, jrb1}].input * (yr - yb) + refinement[{ir, jrb}].input * (yb + 1.0 - yr)
-      end
+  -- Next, interpolate in the y direction.
+  for jr = 0, conf.nRefinementTrue - 1 do
+    var yr : double = conf.meshSpacing * jr
+    var jb : int = yr
+    var jrb : int = jb * conf.expand
+    var jrb1 : int = (jb + 1) * conf.expand
+    var yb : double = jb
+    for ir = 0, conf.nRefinementTrue do
+      refinement[{ir, jr}].input = refinement[{ir, jrb1}].input * (yr - yb) + refinement[{ir, jrb}].input * (yb + 1.0 - yr)
     end
   end
 end
@@ -313,6 +320,7 @@ function generateMainTask(N)
     var gridSpace = ispace(int2d, {conf.n, conf.n})
     var gridColors = ispace(int2d, factorize(conf.parallelism))
     var grid = region(gridSpace, Point)
+    fill(grid.{input, output}, 0)
     var gridPartition = partition(equal, grid, gridColors)
     for c in gridColors do
       initializeGrid(gridPartition[c])
@@ -406,7 +414,11 @@ function generateMainTask(N)
         -- Pick the correct refinement to interpolate.
         [
           generateIf(4, g, function(i) return rquote
-              interpolateRefinement([refinements[i]], gridPartitionsForRefinement[g], conf, istart[g], jstart[g])
+              if conf.expand == 1 then
+                interpolateSimple([refinements[i]], gridPartitionsForRefinement[g], conf, istart[g], jstart[g])
+              else
+                interpolateRefinement([refinements[i]], gridPartitionsForRefinement[g], conf, istart[g], jstart[g])
+              end
             end 
           end)
         ];
