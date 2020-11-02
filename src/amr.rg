@@ -403,6 +403,7 @@ function generateMainTask(N)
     for iter = 0, conf.iterations + 1 do
       -- Start timer after a warmup iteration.
       if iter == 1 then
+        __fence(__execution, __block)
         stencilTime = c.legion_get_current_time_in_micros()
       end
 
