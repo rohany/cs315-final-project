@@ -81,6 +81,69 @@ task createInteriorPartition(grid: region(ispace(int2d), Point))
   return interiorPartition
 end
 
+__demand(__cuda)
+task applyStencilRealHalo(
+  mult: double, 
+  top: region(ispace(int2d), Point),
+  bot: region(ispace(int2d), Point),
+  left: region(ispace(int2d), Point),
+  right: region(ispace(int2d), Point),
+  private: region(ispace(int2d), Point)
+) where
+  reads(top.input, bot.input, left.input, right.input, private.{input, output}),
+  writes(private.output)
+do
+  var bounds = private.bounds
+  var lox = bounds.lo.x
+  var loy = bounds.lo.y
+  var hix = bounds.hi.x
+  var hiy = bounds.hi.y
+  for p in private do
+    var i = p.x
+    var j = p.y
+
+    for jj=-RADIUS,0 do
+      var val : double
+      if j + jj < loy then
+        val = top[{i, j + jj}].input
+      else
+        val = private[{i, j + jj}].input
+      end
+      private[p].output += mult / (2.0 * RADIUS * jj) * val
+    end
+
+    for jj=1,RADIUS+1 do
+      var val : double
+      if j + jj >= hiy then
+        val = bot[{i, j + jj}].input
+      else
+        val = private[{i, j + jj}].input
+      end
+      private[p].output += mult / (2.0 * RADIUS * jj) * val
+    end
+    
+    for ii=-RADIUS,0 do
+      var val : double
+      if i + ii < lox then
+        val = left[{i + ii, j}].input
+      else
+        val = private[{i + ii, j}].input
+      end
+      private[p].output += mult / (2.0 * RADIUS * ii) * val
+    end
+
+    for ii=1,RADIUS+1 do
+      var val : double
+      if i + ii >= hix then
+        val = right[{i + ii, j}].input
+      else
+        val = private[{i + ii, j}].input
+      end
+      private[p].output += mult / (2.0 * RADIUS * ii) * val
+    end
+  end
+end
+
 -- applyStencil applies the statically known "star" stencil to each point
 -- in the input grid. It operates on a private partition of the grid to
 -- write into, and a halo partition of each private partition to read from.
@@ -143,6 +206,20 @@ do
     refinement[p].input = grid[{p.x + istart, p.y + jstart}].input
   end
 end
+
+-- task testCuda1(
+--   space: ispace(int2d),
+--   refinement: region(ispace(int2d), Point),
+--   grid: region(ispace(int2d), Point),
+--   conf: Config,
+--   istart: int,
+--   jstart: int
+-- ) where
+--   reads(grid.{input}, refinement.{input}),
+--   writes(refinement.{input})
+-- do
+-- 
+-- end
 
 -- Use a two-stage, bi-linear interpolation from background grid to refinement.
 -- TODO (rohany): Parallelize this. It seems like it will be tricky though.
@@ -331,12 +408,30 @@ function generateMainTask(N)
     var gridInteriorPrivate = partition(equal, gridInterior, gridColors)
     -- Create a halo partition for ghost region access.
     var cHalo = c.legion_domain_point_coloring_create()
+    var cTop = c.legion_domain_point_coloring_create()
+    var cBot = c.legion_domain_point_coloring_create()
+    var cLeft = c.legion_domain_point_coloring_create()
+    var cRight = c.legion_domain_point_coloring_create()
     for color in gridColors do
       var bounds = gridInteriorPrivate[color].bounds
       var haloBounds = rect2d { bounds.lo - {RADIUS, RADIUS}, bounds.hi + {RADIUS, RADIUS} }
       c.legion_domain_point_coloring_color_domain(cHalo, color, haloBounds)
+      var topBounds = rect2d { bounds.lo - {RADIUS, RADIUS}, {bounds.hi.x + RADIUS, bounds.lo.y} }
+      var botBounds = rect2d { {bounds.lo.x - RADIUS, bounds.hi.y} , bounds.hi + {RADIUS, RADIUS} }
+      var leftBounds = rect2d { bounds.lo - {RADIUS, RADIUS}, {bounds.lo.x, bounds.hi.y + RADIUS} }
+      var rightBounds = rect2d { {bounds.hi.x, bounds.lo.y - RADIUS}, bounds.hi + {RADIUS, RADIUS} }
+      c.legion_domain_point_coloring_color_domain(cTop, color, topBounds)
+      c.legion_domain_point_coloring_color_domain(cBot, color, botBounds)
+      c.legion_domain_point_coloring_color_domain(cLeft, color, leftBounds)
+      c.legion_domain_point_coloring_color_domain(cRight, color, rightBounds)
     end
     var gridHalo = partition(aliased, grid, cHalo, gridColors)
+    -- var gridWide = partition(aliased, grid, cHalo, gridColors)
+    -- var gridHalo = gridWide - gridInteriorPrivate
+    var gridTop = partition(aliased, grid, cTop, gridColors)
+    var gridBot = partition(aliased, grid, cBot, gridColors)
+    var gridLeft = partition(aliased, grid, cLeft, gridColors)
+    var gridRight = partition(aliased, grid, cRight, gridColors)
     c.legion_domain_point_coloring_destroy(cHalo)
 
     -- Set up the regions corresponding to the refinements.
@@ -445,9 +540,16 @@ function generateMainTask(N)
       end
       
       -- Apply the stencil operator to the background grid.
-      for c in gridColors do
-        applyStencil(1.0, gridHalo[c], gridInteriorPrivate[c])
+      if conf.fancy then
+        for c in gridColors do
+          applyStencilRealHalo(1.0, gridTop[c], gridBot[c], gridLeft[c], gridRight[c], gridInteriorPrivate[c])
+        end
+      else
+        for c in gridColors do
+          applyStencil(1.0, gridHalo[c], gridInteriorPrivate[c])
+        end
       end
+
       -- Add constant to solution to force refresh of neighbor data.
       for c in gridColors do
         addConstantToInput(gridPartition[c])

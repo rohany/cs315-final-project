@@ -28,6 +28,8 @@ struct Config {
   
   activePoints: double,
   activeRefinementPoints: double,
+
+  fancy: bool,
 }
 
 -- Initialize a config with zero values.
@@ -46,6 +48,8 @@ terra initializeConfig(conf: &Config)
 
   conf.meshSpacing = 1.0
   conf.expand = 1
+
+  conf.fancy = false
 end
 
 -- Parse command line input flags into a config.
@@ -83,6 +87,8 @@ terra parseInputArguments(conf: &Config)
     elseif cstring.strcmp(args.argv[i], "-pr") == 0 then
       i = i + 1
       conf.refinementParallelism = std.atoi(args.argv[i])
+    elseif cstring.strcmp(args.argv[i], "-f") == 0 then
+      conf.fancy = true
     end
   end
 
