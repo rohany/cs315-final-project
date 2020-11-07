@@ -9,6 +9,7 @@ local c = regentlib.c
 local cstring = terralib.includec("string.h")
 local std = terralib.includec("stdlib.h")
 local math = terralib.includec("math.h")
+local MAPPER = terralib.includec("amr_mapper.h")
 
 -- Set up constants.
 local EPSILON = 1e-8
@@ -86,6 +87,39 @@ end
 -- write into, and a halo partition of each private partition to read from.
 __demand(__cuda)
 task applyStencil(
+  mult: double, 
+  halo: region(ispace(int2d), Point),
+  private: region(ispace(int2d), Point)
+) where
+  reads(halo.input, private.output),
+  writes(private.output)
+do
+  for p in private do
+    var i = p.x
+    var j = p.y
+
+    for jj=-RADIUS,0 do
+      private[p].output += mult / (2.0 * RADIUS * jj) * halo[{i, j + jj}].input
+    end
+
+    for jj=1,RADIUS+1 do
+      private[p].output += mult / (2.0 * RADIUS * jj) * halo[{i, j + jj}].input
+    end
+    
+    for ii=-RADIUS,0 do
+      private[p].output += mult / (2.0 * RADIUS * ii) * halo[{i+ii, j}].input
+    end
+
+    for ii=1,RADIUS+1 do
+      private[p].output += mult / (2.0 * RADIUS * ii) * halo[{i+ii, j}].input
+    end
+  end
+end
+
+-- applyRefinementStencil is the same as applyStencil, but is separate into 
+-- another function for clarity in profiles and potential future mapping optimizations.
+__demand(__cuda)
+task applyRefinementStencil(
   mult: double, 
   halo: region(ispace(int2d), Point),
   private: region(ispace(int2d), Point)
@@ -433,7 +467,7 @@ function generateMainTask(N)
             generateIf(4, g, function(i) return
               rquote
                 for color in refinementColors do
-                  applyStencil(conf.expand, [refinementHalos[i]][color], [refinementPrivateInteriors[i]][color])
+                  applyRefinementStencil(conf.expand, [refinementHalos[i]][color], [refinementPrivateInteriors[i]][color])
                 end
                 for color in refinementColors do
                   addConstantToInput([refinementPartitions[i]][color])
@@ -545,12 +579,4 @@ function generateMainTask(N)
 end
 
 local amrMain = generateMainTask(4)
-
-terra registerMappers()
-  -- saveobj requires a thunk to register any custom mappers.
-  -- We don't have any right now, so just send in an empty thunk.
-  return
-end
--- TODO (rohany): If we are going to compile this on other machines
---  than Sherlock, the PMIx link should be optional.
-regentlib.saveobj(amrMain, "amr", "executable", registerMappers, terralib.newlist({"-lpmix", "-lm"}))
+regentlib.saveobj(amrMain, "amr.o", "object", MAPPER.register_mappers)
