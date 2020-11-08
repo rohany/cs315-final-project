@@ -94,24 +94,22 @@ task applyStencil(
   reads(halo.input, private.output),
   writes(private.output)
 do
+  __demand(__vectorize)
   for p in private do
-    var i = p.x
-    var j = p.y
-
     for jj=-RADIUS,0 do
-      private[p].output += mult / (2.0 * RADIUS * jj) * halo[{i, j + jj}].input
+      private[p].output += mult / (2.0 * RADIUS * jj) * halo[p + {0, jj}].input
     end
 
     for jj=1,RADIUS+1 do
-      private[p].output += mult / (2.0 * RADIUS * jj) * halo[{i, j + jj}].input
+      private[p].output += mult / (2.0 * RADIUS * jj) * halo[p + {0, jj}].input
     end
-    
+     
     for ii=-RADIUS,0 do
-      private[p].output += mult / (2.0 * RADIUS * ii) * halo[{i+ii, j}].input
+      private[p].output += mult / (2.0 * RADIUS * ii) * halo[p + {ii, 0}].input
     end
 
     for ii=1,RADIUS+1 do
-      private[p].output += mult / (2.0 * RADIUS * ii) * halo[{i+ii, j}].input
+      private[p].output += mult / (2.0 * RADIUS * ii) * halo[p + {ii, 0}].input
     end
   end
 end
@@ -127,24 +125,22 @@ task applyRefinementStencil(
   reads(halo.input, private.output),
   writes(private.output)
 do
+  __demand(__vectorize)
   for p in private do
-    var i = p.x
-    var j = p.y
-
     for jj=-RADIUS,0 do
-      private[p].output += mult / (2.0 * RADIUS * jj) * halo[{i, j + jj}].input
+      private[p].output += mult / (2.0 * RADIUS * jj) * halo[p + {0, jj}].input
     end
 
     for jj=1,RADIUS+1 do
-      private[p].output += mult / (2.0 * RADIUS * jj) * halo[{i, j + jj}].input
+      private[p].output += mult / (2.0 * RADIUS * jj) * halo[p + {0, jj}].input
     end
-    
+     
     for ii=-RADIUS,0 do
-      private[p].output += mult / (2.0 * RADIUS * ii) * halo[{i+ii, j}].input
+      private[p].output += mult / (2.0 * RADIUS * ii) * halo[p + {ii, 0}].input
     end
 
     for ii=1,RADIUS+1 do
-      private[p].output += mult / (2.0 * RADIUS * ii) * halo[{i+ii, j}].input
+      private[p].output += mult / (2.0 * RADIUS * ii) * halo[p + {ii, 0}].input
     end
   end
 end
@@ -155,6 +151,7 @@ task addConstantToInput(grid: region(ispace(int2d), Point))
 where
   reads writes(grid.input)
 do
+  __demand(__vectorize)
   for p in grid do
     grid[p].input += 1.0
   end
@@ -194,8 +191,9 @@ task interpolateSimple(
   reads(grid.{input}, refinement.{input}),
   writes(refinement.{input})
 do
+  __demand(__vectorize)
   for p in refinement do
-    refinement[p].input = grid[{p.x + istart, p.y + jstart}].input
+    refinement[p].input = grid[p + {istart, jstart}].input
   end
 end
 
