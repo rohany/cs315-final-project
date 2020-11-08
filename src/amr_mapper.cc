@@ -12,6 +12,12 @@ class AMRMapper: public DefaultMapper {
 public:
     AMRMapper(Runtime* rt, Machine machine, Processor local)
     : DefaultMapper(rt->get_mapper_runtime(), machine, local, "amr_mapper") {}
+
+    // This mapper currently does nothing different than the default mapper.
+    // I thought that I would need to do something by hand here after seeing
+    // load balancing related problems in performance profiles, but those appear
+    // to be handled by just creating more partitions. We'll keep this mapper
+    // around in case we want to experiment with the LifeLine mapper though.
 };
 
 static void create_mappers(Machine machine,
