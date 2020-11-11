@@ -157,27 +157,6 @@ do
   end
 end
 
-__demand(__inner)
-task refinementChunk(
-  conf: Config, 
-  refinementColors: ispace(int2d),
-  refinement: region(ispace(int2d), Point),
-  halos: partition(aliased, refinement, ispace(int2d)),
-  equals: partition(disjoint, refinement, ispace(int2d)),
-  interiors: partition(disjoint, refinement, ispace(int2d))
-) where
-  reads writes (refinement)
-do
-  for subIter = 0, conf.refinementIterations do
-    for c in refinementColors do
-      applyRefinementStencil(conf.expand, halos[c], interiors[c])
-    end
-    for c in refinementColors do
-      addConstantToInput(equals[c])
-    end
-  end
-end
-
 -- interpolateSimple is used when conf.expand == 1. In this case,
 -- we can just copy over values from the background grid.
 __demand(__cuda)
@@ -314,10 +293,6 @@ function generateMainTask(N)
   local refinementInteriors = generate(4, function(i)
     return regentlib.newsymbol()
   end)
-  -- TODO (rohany): Comment
-  local refinementPrivateInteriorTemps = generate(4, function(i)
-    return regentlib.newsymbol()
-  end)
   -- refinementPrivateInteriors is the constant set of equal partitions of
   -- the refinements.
   local refinementPrivateInteriors = generate(4, function(i)
@@ -331,10 +306,6 @@ function generateMainTask(N)
   -- refinementHaloColorings is a set of temporary objects use to partition each
   -- refinement.
   local refinementHaloColorings = generate(4, function(i)
-    return regentlib.newsymbol()
-  end)
-  -- TODO (rohany): comment
-  local refinementInteriorColorings = generate(4, function(i)
     return regentlib.newsymbol()
   end)
   -- refinementNorms is a set of 0's equal to the number of refinements to
@@ -413,14 +384,7 @@ function generateMainTask(N)
           -- Create the refinement interior partitions.
           var [refinementInteriors[i]] = createInteriorPartition([refinements[i]])[0]
           -- Create the private partitions of the interior.
-          var [refinementPrivateInteriorTemps[i]] = partition(equal, [refinementInteriors[i]], refinementColors)
-          var [refinementInteriorColorings[i]] = c.legion_domain_point_coloring_create()
-          for color in refinementColors do
-            var bounds = [refinementPrivateInteriorTemps[i]][color].bounds
-            c.legion_domain_point_coloring_color_domain([refinementInteriorColorings[i]], color, bounds)
-          end
-          var [refinementPrivateInteriors[i]] = partition(disjoint, [refinements[i]], [refinementInteriorColorings[i]], refinementColors)
-          c.legion_domain_point_coloring_destroy([refinementInteriorColorings[i]]) 
+          var [refinementPrivateInteriors[i]] = partition(equal, [refinementInteriors[i]], refinementColors)
           -- Create a halo partition for each refinement region's ghost access.
           -- TODO (rohany): Can we refactor this code to not duplicate as much?
           var [refinementHaloColorings[i]] = c.legion_domain_point_coloring_create()
@@ -495,20 +459,6 @@ function generateMainTask(N)
 
       -- Perform any needed stencil iterations on the refinement grids.
       if (iter % conf.refinementPeriod) < conf.refinementDuration then
-        -- [
-        --   generateIf(4, g, function(i) return
-        --     rquote
-        --       refinementChunk(
-        --         conf, 
-        --         refinementColors, 
-        --         [refinements[i]], 
-        --         [refinementHalos[i]], 
-        --         [refinementPartitions[i]],
-        --         [refinementPrivateInteriors[i]]
-        --       )
-        --     end
-        --   end)
-        -- ];
         for subIter = 0, conf.refinementIterations do
           [
             generateIf(4, g, function(i) return
