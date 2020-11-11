@@ -1,3 +1,6 @@
 serial-amr
 parallel-amr
 mpi-amr
+*.o
+*.nfs*
+*.pyc
